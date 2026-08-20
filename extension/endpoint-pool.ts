@@ -30,6 +30,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isFreeModel, type RawORModel } from "./or-free.ts";
+import { getEnvValue, resolveApiKey, readUserProviders, type UserProvider } from "./shared.ts";
 
 // ---------------------------------------------------------------------------
 // 池种类定义
@@ -155,24 +156,6 @@ async function savePool(kind: PoolKind, pool: EPPoolState): Promise<void> {
 // 环境变量与用户服务商
 // ---------------------------------------------------------------------------
 
-function getEnvValue(name: string): string | undefined {
-  const v = process.env[name];
-  if (v) return v;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { execSync } = require("node:child_process") as typeof import("node:child_process");
-    const out = execSync(`reg query \"HKCU\\\\Environment\" /v ${name}`, {
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: 5000,
-    });
-    const m = out.match(/REG_SZ\s+(\S.*)/);
-    return m ? m[1].trim() : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 /** 解析池条目里的 key 引用：兼容 $"NAME" 与 "NAME" 两种格式。 */
 function resolvePoolKey(apiKeyRef: string | undefined): string | undefined {
   if (!apiKeyRef) return undefined;
@@ -206,44 +189,17 @@ function getXiaomiKey(): string | undefined {
   return undefined;
 }
 
-function resolveApiKey(config: unknown): string | undefined {
-  if (typeof config !== "string" || !config) return undefined;
-  const m = config.match(/^\$(.+)$/);
-  return m ? getEnvValue(m[1]) : config;
-}
-
-interface UserProvider {
-  id: string;
-  name: string;
-  baseUrl: string;
-  apiKey: string;
-  apiKeyRef?: string;
-}
-
-function readUserProviders(): UserProvider[] {
-  const out: UserProvider[] = [];
+/** OpenRouter API key：环境变量优先，回退 pi 注册表凭据（/login openrouter 存 auth.json）。 */
+async function getOpenRouterKey(ctx: ExtensionContext): Promise<string | undefined> {
+  const env = getEnvValue("OPENROUTER_API_KEY");
+  if (env) return env;
   try {
-    const raw = readFileSync(join(getAgentDir(), "models.json"), "utf8");
-    const cfg = JSON.parse(raw) as {
-      providers?: Record<string, { name?: string; baseUrl?: string; apiKey?: string }>;
-    };
-    for (const [id, def] of Object.entries(cfg.providers ?? {})) {
-      if (id === "openrouter") continue;
-      if (!def?.baseUrl) continue;
-      const apiKey = resolveApiKey(def.apiKey);
-      if (!apiKey) continue;
-      out.push({
-        id,
-        name: def.name ?? id,
-        baseUrl: def.baseUrl.endsWith("/") ? def.baseUrl.slice(0, -1) : def.baseUrl,
-        apiKey,
-        apiKeyRef: typeof def.apiKey === "string" && def.apiKey.startsWith("$") ? def.apiKey : undefined,
-      });
-    }
+    const key = await ctx.modelRegistry.getApiKeyForProvider("openrouter");
+    if (key) return key;
   } catch {
-    // 无 models.json
+    // 回退 undefined
   }
-  return out;
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,14 +294,15 @@ async function discoverKind(ctx: ExtensionContext, kind: PoolKind): Promise<numb
       }
     }
   }
+  // 内置服务商免费候选（嵌入池：Cloudflare bge / NVIDIA nv-embed）
+  added += await discoverBuiltinCandidates(kind, ctx, pool);
+  // OpenRouter 目录动态候选（embed/TTS/ASR 的 free 模型，按 output_modalities 精确拉取）
+  added += await discoverOpenRouterCatalog(kind, ctx, pool);
+  // 统一保存：一次 loadPool、一次 savePool（三个来源共享同一份池快照）
   if (added > 0) {
     pool.updatedAt = Date.now();
     await savePool(kind, pool);
   }
-  // 内置服务商免费候选（嵌入池：Cloudflare bge / NVIDIA nv-embed）
-  added += await discoverBuiltinCandidates(kind);
-  // OpenRouter 目录动态候选（embed/TTS/ASR 的 free 模型，按 output_modalities 精确拉取）
-  added += await discoverOpenRouterCatalog(kind);
   return added;
 }
 
@@ -367,8 +324,8 @@ const OR_MODALITY_QUERY: Record<PoolKind, string> = {
 
 /** 从 OpenRouter 目录动态发现 free 模型并端点验证入池。返回新增数量。
  *  验证即真相：目录标注只作候选，端点请求 200 通过才入池。 */
-async function discoverOpenRouterCatalog(kind: PoolKind): Promise<number> {
-  const apiKey = getEnvValue("OPENROUTER_API_KEY");
+async function discoverOpenRouterCatalog(kind: PoolKind, ctx: ExtensionContext, pool: EPPoolState): Promise<number> {
+  const apiKey = await getOpenRouterKey(ctx);
   if (!apiKey) return 0;
   const modality = OR_MODALITY_QUERY[kind];
   let raw: RawORModel[];
@@ -384,7 +341,6 @@ async function discoverOpenRouterCatalog(kind: PoolKind): Promise<number> {
   }
   const free = raw.filter(isFreeModel);
   if (free.length === 0) return 0;
-  const pool = await loadPool(kind);
   const poolIds = new Set(pool.models.map((m) => m.id));
   let added = 0;
   for (const m of free) {
@@ -417,10 +373,6 @@ async function discoverOpenRouterCatalog(kind: PoolKind): Promise<number> {
       // 跳过失败候选
     }
   }
-  if (added > 0) {
-    pool.updatedAt = Date.now();
-    await savePool(kind, pool);
-  }
   return added;
 }
 
@@ -437,11 +389,11 @@ function isFresh(pool: EPPoolState): boolean {
 
 const refreshingKind = new Map<PoolKind, Promise<EPPoolState>>();
 
-async function refreshKind(kind: PoolKind): Promise<EPPoolState> {
+async function refreshKind(kind: PoolKind, ctx: ExtensionContext): Promise<EPPoolState> {
   const existing = refreshingKind.get(kind);
   if (existing) return existing;
   const task = (async () => {
-    await discoverKind({} as ExtensionContext, kind);
+    await discoverKind(ctx, kind);
     const pool = await loadPool(kind);
     pool.updatedAt = Date.now();
     await savePool(kind, pool);
@@ -455,11 +407,11 @@ async function refreshKind(kind: PoolKind): Promise<EPPoolState> {
   }
 }
 
-async function ensureFreshPool(kind: PoolKind): Promise<EPPoolState> {
+async function ensureFreshPool(kind: PoolKind, ctx: ExtensionContext): Promise<EPPoolState> {
   const pool = await loadPool(kind);
   if (isFresh(pool)) return pool;
   try {
-    return await refreshKind(kind);
+    return await refreshKind(kind, ctx);
   } catch {
     return pool; // 刷新失败不阻塞，用旧池
   }
@@ -537,16 +489,28 @@ const BUILTIN_CANDIDATES: Record<PoolKind, BuiltinCandidate[]> = {
       models: [{ id: "mimo-v2.5-asr" }],
     },
   ],
-  rerank: [],
+  rerank: [
+    {
+      provider: "openrouter",
+      keyEnv: "OPENROUTER_API_KEY",
+      baseUrl: () => "https://openrouter.ai/api/v1",
+      models: [{ id: "nvidia/llama-nemotron-rerank-vl-1b-v2:free" }],
+    },
+  ],
 };
+
+/** 从 TTS 400 错误信息里提取受支持的 voice（优先带 -en 后缀的）。 */
+function extractSupportedVoice(errorText: string): string | undefined {
+  const names = errorText.match(/[a-z0-9-]+-en|[a-z0-9]+-[a-z0-9]+-en|[a-z0-9-]+/g) ?? [];
+  return names.find((v) => /-en$/.test(v) || v.includes("-"));
+}
 
 /** TTS 等端点：400 时从错误信息提取支持的 voice 并重试（自动适配）。 */
 async function sendWithVoiceAdapt(baseUrl: string, apiKey: string, kind: PoolKind, m: { id: string; body?: Record<string, unknown> }, signal: AbortSignal): Promise<{ status: number; text: string; buffer?: Buffer }> {
   let body = { model: m.id, input: "hi", voice: kind === "tts" ? "alloy" : undefined, ...(m.body ?? {}) };
   let r = await sendEndpointRequest(baseUrl, apiKey, kind, m.id, body, signal);
   if (r.status === 400 && kind === "tts" && r.text.includes("Supported voices")) {
-    const names = r.text.match(/[a-z0-9-]+-en|[a-z0-9]+-[a-z0-9]+-en|[a-z0-9-]+/g) ?? [];
-    const voice = names.find((v) => /-en$/.test(v) || v.includes("-"));
+    const voice = extractSupportedVoice(r.text);
     if (voice) {
       body = { model: m.id, input: "hi", voice, ...(m.body ?? {}) };
       r = await sendEndpointRequest(baseUrl, apiKey, kind, m.id, body, signal);
@@ -621,14 +585,17 @@ async function verifyXiaomi(kind: PoolKind, key: string): Promise<boolean> {
 }
 
 /** 发现已知免费端点模型候选（OpenRouter 隐藏模型 + 内置服务商 + 小米特殊格式）并入池。返回新增数量。 */
-async function discoverBuiltinCandidates(kind: PoolKind): Promise<number> {
+async function discoverBuiltinCandidates(kind: PoolKind, ctx: ExtensionContext, pool: EPPoolState): Promise<number> {
   const candidates = BUILTIN_CANDIDATES[kind];
   if (candidates.length === 0) return 0;
-  const pool = await loadPool(kind);
   const poolIds = new Set(pool.models.map((m) => m.id));
   let added = 0;
   for (const c of candidates) {
-    const apiKey = c.provider === "xiaomi-clean" ? getXiaomiKey() : getEnvValue(c.keyEnv);
+    const apiKey = c.provider === "xiaomi-clean"
+      ? getXiaomiKey()
+      : c.provider === "openrouter"
+        ? await getOpenRouterKey(ctx)
+        : getEnvValue(c.keyEnv);
     const baseUrl = c.baseUrl();
     if (!apiKey || !baseUrl) continue;
     for (const m of c.models) {
@@ -655,10 +622,6 @@ async function discoverBuiltinCandidates(kind: PoolKind): Promise<number> {
         // 跳过
       }
     }
-  }
-  if (added > 0) {
-    pool.updatedAt = Date.now();
-    await savePool(kind, pool);
   }
   return added;
 }
@@ -698,14 +661,14 @@ async function embedText(ctx: ExtensionContext, text: string, signal?: AbortSign
     }
     throw new Error(errors.length ? errors.join("；") : "嵌入池为空");
   };
-  const pool = await ensureFreshPool("embed");
+  const pool = await ensureFreshPool("embed", ctx);
   if (pool.models.length === 0) throw new Error("嵌入池为空，请先运行 /embed-discover");
   try {
     return await attempt(pool);
   } catch (firstErr) {
     if (!pool.config.refreshOnAllFailed) throw firstErr;
     try {
-      return await attempt(await refreshKind("embed"));
+      return await attempt(await refreshKind("embed", ctx));
     } catch {
       throw firstErr;
     }
@@ -746,8 +709,7 @@ async function synthesizeOnce(m: EPPoolModel, text: string, signal: AbortSignal)
   let body: Record<string, unknown> = { model: m.id, input: text, voice: "alloy", response_format: "mp3" };
   let r = await sendEndpointRequest(m.baseUrl, key ?? "", "tts", m.id, body, signal);
   if (r.status === 400 && r.text.includes("Supported voices")) {
-    const names = r.text.match(/[a-z0-9-]+-en|[a-z0-9]+-[a-z0-9]+-en|[a-z0-9-]+/g) ?? [];
-    const voice = names.find((v) => /-en$/.test(v) || v.includes("-"));
+    const voice = extractSupportedVoice(r.text);
     if (voice) {
       body = { model: m.id, input: text, voice, response_format: "mp3" };
       r = await sendEndpointRequest(m.baseUrl, key ?? "", "tts", m.id, body, signal);
@@ -781,14 +743,14 @@ async function synthesizeSpeech(
     }
     throw new Error(errors.length ? errors.join("；") : "TTS 池为空");
   };
-  const pool = await ensureFreshPool("tts");
+  const pool = await ensureFreshPool("tts", ctx);
   if (pool.models.length === 0) throw new Error("TTS 池为空，请先运行 /tts-discover");
   try {
     return await attempt(pool);
   } catch (firstErr) {
     if (!pool.config.refreshOnAllFailed) throw firstErr;
     try {
-      return await attempt(await refreshKind("tts"));
+      return await attempt(await refreshKind("tts", ctx));
     } catch {
       throw firstErr;
     }
@@ -860,14 +822,14 @@ async function transcribeAudio(
     }
     throw new Error(errors.length ? errors.join("；") : "ASR 池为空");
   };
-  const pool = await ensureFreshPool("asr");
+  const pool = await ensureFreshPool("asr", ctx);
   if (pool.models.length === 0) throw new Error("ASR 池为空，请先运行 /asr-discover");
   try {
     return await attempt(pool);
   } catch (firstErr) {
     if (!pool.config.refreshOnAllFailed) throw firstErr;
     try {
-      return await attempt(await refreshKind("asr"));
+      return await attempt(await refreshKind("asr", ctx));
     } catch {
       throw firstErr;
     }
@@ -911,14 +873,14 @@ async function rerankText(
     }
     throw new Error(errors.length ? errors.join("；") : "重排池为空");
   };
-  const pool = await ensureFreshPool("rerank");
+  const pool = await ensureFreshPool("rerank", ctx);
   if (pool.models.length === 0) throw new Error("重排池为空，请先运行 /rerank-discover");
   try {
     return await attempt(pool);
   } catch (firstErr) {
     if (!pool.config.refreshOnAllFailed) throw firstErr;
     try {
-      return await attempt(await refreshKind("rerank"));
+      return await attempt(await refreshKind("rerank", ctx));
     } catch {
       throw firstErr;
     }
@@ -985,7 +947,7 @@ function registerKindCommands(pi: ExtensionAPI, kind: PoolKind): void {
     handler: async (_args, ctx) => {
       ctx.ui.notify(`正在刷新${spec.label}池…`, "info");
       try {
-        await refreshKind(kind);
+        await refreshKind(kind, ctx);
         const pool = await loadPool(kind);
         ctx.ui.notify(
           `${spec.label}池已刷新：在线 ${pool.models.length} 个模型`,
@@ -1076,7 +1038,7 @@ export function initEndpointPools(pi: ExtensionAPI): void {
                 ? !!(getXiaomiKey() || getEnvValue("OPENROUTER_API_KEY"))
                 : !!getEnvValue("OPENROUTER_API_KEY"); // rerank
           if (!hasKey) continue;
-          await refreshKind(kind);
+          await refreshKind(kind, ctx);
         } catch {
           // 静默：发现失败不影响启动
         }

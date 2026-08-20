@@ -70,6 +70,7 @@ import { Type } from "typebox";
 import { join, isAbsolute } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { getOpenRouterCatalog, isFreeModel, type RawORModel } from "./or-free.ts";
+import { getEnvValue, resolveApiKey } from "./shared.ts";
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -423,40 +424,6 @@ async function mergeRegistryIntoPool(
 // ---------------------------------------------------------------------------
 // AI 自动发现（读取用户服务商 + LLM 分析 + 实测验证）
 // ---------------------------------------------------------------------------
-
-/** 读取环境变量：优先进程环境，回退 Windows 注册表（setx 后未重启也能读到）。 */
-function getEnvValue(name: string): string | undefined {
-  const v = process.env[name];
-  if (v) return v;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { execSync } = require("node:child_process") as typeof import("node:child_process");
-    const out = execSync(`reg query \"HKCU\\\\Environment\" /v ${name}`, {
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: 5000,
-    });
-    const m = out.match(/REG_SZ\s+(\S.*)/);
-    return m ? m[1].trim() : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** 解析 apiKey 配置值：支持明文与 $ENV 引用。 */
-function resolveApiKey(apiKeyConfig: unknown): string | undefined {
-  if (typeof apiKeyConfig !== "string" || !apiKeyConfig) return undefined;
-  const m = apiKeyConfig.match(/^\$(.+)$/);
-  return m ? getEnvValue(m[1]) : apiKeyConfig;
-}
-
-/** 用户 models.json 中配置的自定义 provider（有 baseUrl 且能解析出 key 的）。 */
-interface UserProviderInfo {
-  id: string;
-  name: string;
-  baseUrl: string;
-  apiKey: string;
-}
 
 /** 拉取服务商的模型列表（OpenAI 兼容 /models 端点）。失败返回 null。 */
 async function fetchProviderModelList(

@@ -27,9 +27,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { join, isAbsolute } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { readFileSync } from "node:fs";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { getOpenRouterCatalog, isFreeModel, type RawORModel } from "./or-free.ts";
+import { getEnvValue, resolveApiKey, readUserProviders } from "./shared.ts";
 
 interface ImgPoolModel {
   id: string;
@@ -69,65 +69,6 @@ const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-/** 读取环境变量：优先进程环境，回退 Windows 注册表（setx 后未重启也能读到）。 */
-function getEnvValue(name: string): string | undefined {
-  const v = process.env[name];
-  if (v) return v;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { execSync } = require("node:child_process") as typeof import("node:child_process");
-    const out = execSync(`reg query \"HKCU\\\\Environment\" /v ${name}`, {
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: 5000,
-    });
-    const m = out.match(/REG_SZ\s+(\S.*)/);
-    return m ? m[1].trim() : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** 解析 apiKey 配置值：支持明文与 $ENV 引用。 */
-function resolveApiKey(apiKeyConfig: unknown): string | undefined {
-  if (typeof apiKeyConfig !== "string" || !apiKeyConfig) return undefined;
-  const m = apiKeyConfig.match(/^\$(.+)$/);
-  return m ? getEnvValue(m[1]) : apiKeyConfig;
-}
-
-/** 从 models.json 读用户服务商定义（有 baseUrl 且能解析出 key 的）。 */
-function readUserProviders(): Array<{
-  id: string;
-  name: string;
-  baseUrl: string;
-  apiKey: string;
-  apiKeyRef?: string;
-}> {
-  const out: Array<{ id: string; name: string; baseUrl: string; apiKey: string; apiKeyRef?: string }> = [];
-  try {
-    const raw = readFileSync(join(getAgentDir(), "models.json"), "utf8");
-    const cfg = JSON.parse(raw) as {
-      providers?: Record<string, { name?: string; baseUrl?: string; apiKey?: string }>;
-    };
-    for (const [id, def] of Object.entries(cfg.providers ?? {})) {
-      if (id === "openrouter") continue; // OpenRouter 有专门路径
-      if (!def?.baseUrl) continue;
-      const apiKey = resolveApiKey(def.apiKey);
-      if (!apiKey) continue;
-      out.push({
-        id,
-        name: def.name ?? id,
-        baseUrl: def.baseUrl.endsWith("/") ? def.baseUrl.slice(0, -1) : def.baseUrl,
-        apiKey,
-        apiKeyRef: typeof def.apiKey === "string" && def.apiKey.startsWith("$") ? def.apiKey : undefined,
-      });
-    }
-  } catch {
-    // 无 models.json
-  }
-  return out;
 }
 
 async function loadImgPool(): Promise<ImgPoolState> {
