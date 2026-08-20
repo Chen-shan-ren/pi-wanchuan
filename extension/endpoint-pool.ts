@@ -1,21 +1,26 @@
 /**
- * endpoint-pool.ts — 端点池（嵌入 / TTS / ASR）· pi-wanchuan 万川扩展模块
+ * endpoint-pool.ts — 端点池（嵌入 / TTS / ASR / 重排）· pi-wanchuan 万川扩展模块
  *
- * OpenRouter 目前没有嵌入/TTS/ASR 模型，因此这三个池从【用户配置的服务商】
- * （models.json 中有 baseUrl + API key 的）发现模型：拉 /models 列表 → 关键词
- * 启发式候选 → 对候选逐个【实测端点验证】→ 通过者入池。
+ * 四个专用端点池，模型联合发现自：
+ *   1. OpenRouter 目录（按 output_modalities=embeddings/speech/transcription/rerank 精确拉取，
+ *      因为 /models 默认只返回 chat 模型）+ 筛 free
+ *   2. 用户配置的服务商（models.json 有 baseUrl + API key）：/models 关键词候选
+ *   3. 内置免费候选（OpenRouter 隐藏模型 + Cloudflare/NVIDIA/小米兜底）
+ * 候选逐个【端点实测验证】后入池——发对应端点最小请求，200 才入池（LLM 不参与，零幻觉）。
  *
- * 验证即真相：发对应端点最小请求，200 即入池（LLM 不参与，零幻觉）。
+ * 自动刷新：池为空或过期（默认 24h）自动重拉；/<kind>-refresh 手动强制；调用全失败自动刷新重试。
  *
- * 命令（kind = embed | tts | asr）：
+ * 命令（kind = embed | tts | asr | rerank）：
  *   /<kind>-pool             查看池
- *   /<kind>-discover         从用户服务商发现模型（端点验证）
+ *   /<kind>-refresh          强制刷新池
+ *   /<kind>-discover         发现模型（端点验证）
  *   /<kind>-priority [n] [k] 设置优先级
  *   /embed <文本>            文本 → 向量（显示维度/前几维）
  *   /tts <文本>              文本 → 语音文件（保存到本地）
  *   /asr <音频路径>          音频 → 文本
+ *   /rerank <查询> | <文档1> | <文档2> …   按相关性重排文档
  *
- * 工具：embed_text / text_to_speech / transcribe_audio
+ * 工具：embed_text / text_to_speech / transcribe_audio / rerank_text
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -24,12 +29,13 @@ import { join, isAbsolute } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { isFreeModel, type RawORModel } from "./or-free.ts";
 
 // ---------------------------------------------------------------------------
 // 池种类定义
 // ---------------------------------------------------------------------------
 
-type PoolKind = "embed" | "tts" | "asr";
+type PoolKind = "embed" | "tts" | "asr" | "rerank";
 
 interface KindSpec {
   label: string;
@@ -71,6 +77,15 @@ const KIND_SPECS: Record<PoolKind, KindSpec> = {
     }),
     verifyOk: (status, _body) => status === 200,
   },
+  rerank: {
+    label: "重排",
+    keywords: /rerank|rank|relevan|jina|cohere|cross-encoder/i,
+    endpoint: "rerank",
+    verifyBody: (modelId) => ({
+      body: { model: modelId, query: "hi", documents: ["hello", "world"] },
+    }),
+    verifyOk: (status, body) => status === 200 && body.includes('"relevance_score"'),
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -86,10 +101,25 @@ interface EPPoolModel {
   userSet?: boolean;
 }
 
+interface EPPoolConfig {
+  ttlHours: number; // 池过期时间（小时），默认 24
+  refreshOnStartup: boolean; // 启动时后台异步刷新（池为空或过期时），默认 true
+  refreshOnAllFailed: boolean; // 全部候选调用失败后强制刷新重试，默认 true
+  maxModels: number; // 池容量上限，默认 100
+}
+
 interface EPPoolState {
   updatedAt: number;
   models: EPPoolModel[];
+  config: EPPoolConfig;
 }
+
+const DEFAULT_CONFIG: EPPoolConfig = {
+  ttlHours: 24,
+  refreshOnStartup: true,
+  refreshOnAllFailed: true,
+  maxModels: 100,
+};
 
 function poolFile(kind: PoolKind): string {
   return join(getAgentDir(), `${kind}-pool.json`);
@@ -107,12 +137,13 @@ async function loadPool(kind: PoolKind): Promise<EPPoolState> {
       return {
         updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0,
         models: parsed.models.filter((m) => m && typeof m.id === "string"),
+        config: { ...DEFAULT_CONFIG, ...(parsed.config ?? {}) },
       };
     }
   } catch {
     // 首次运行
   }
-  return { updatedAt: 0, models: [] };
+  return { updatedAt: 0, models: [], config: { ...DEFAULT_CONFIG } };
 }
 
 async function savePool(kind: PoolKind, pool: EPPoolState): Promise<void> {
@@ -313,7 +344,125 @@ async function discoverKind(ctx: ExtensionContext, kind: PoolKind): Promise<numb
   }
   // 内置服务商免费候选（嵌入池：Cloudflare bge / NVIDIA nv-embed）
   added += await discoverBuiltinCandidates(kind);
+  // OpenRouter 目录动态候选（embed/TTS/ASR 的 free 模型，按 output_modalities 精确拉取）
+  added += await discoverOpenRouterCatalog(kind);
   return added;
+}
+
+// ---------------------------------------------------------------------------
+// 动态发现：从 OpenRouter /models 目录（带 output_modalities 过滤）拉取各池 free 模型
+// ---------------------------------------------------------------------------
+
+const OR_BASE = "https://openrouter.ai/api/v1";
+
+/** OpenRouter 各池对应的 /models?output_modalities= 过滤值。
+ *  不带该参数时 /models 默认只返回 chat 模型，embeddings/speech/transcription/rerank
+ *  等专用端点模型不会出现在默认列表里，必须用过滤参数才能列出来。 */
+const OR_MODALITY_QUERY: Record<PoolKind, string> = {
+  embed: "embeddings",
+  tts: "speech",
+  asr: "transcription",
+  rerank: "rerank",
+};
+
+/** 从 OpenRouter 目录动态发现 free 模型并端点验证入池。返回新增数量。
+ *  验证即真相：目录标注只作候选，端点请求 200 通过才入池。 */
+async function discoverOpenRouterCatalog(kind: PoolKind): Promise<number> {
+  const apiKey = getEnvValue("OPENROUTER_API_KEY");
+  if (!apiKey) return 0;
+  const modality = OR_MODALITY_QUERY[kind];
+  let raw: RawORModel[];
+  try {
+    const res = await fetch(`${OR_BASE}/models?output_modalities=${modality}`, {
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return 0;
+    const j = (await res.json()) as { data?: RawORModel[] };
+    raw = Array.isArray(j.data) ? j.data : [];
+  } catch {
+    return 0;
+  }
+  const free = raw.filter(isFreeModel);
+  if (free.length === 0) return 0;
+  const pool = await loadPool(kind);
+  const poolIds = new Set(pool.models.map((m) => m.id));
+  let added = 0;
+  for (const m of free) {
+    const id = m.id;
+    if (poolIds.has(id)) continue;
+    try {
+      const spec = KIND_SPECS[kind];
+      const { body, formData } = spec.verifyBody(id);
+      const r = await sendEndpointRequest(
+        OR_BASE,
+        apiKey,
+        kind,
+        id,
+        body,
+        AbortSignal.timeout(20_000),
+        formData,
+      );
+      if (!spec.verifyOk(r.status, r.text)) continue;
+      const maxP = Math.max(0, ...pool.models.map((mm) => mm.priority));
+      pool.models.push({
+        id,
+        provider: "openrouter",
+        baseUrl: OR_BASE,
+        apiKeyRef: "$OPENROUTER_API_KEY",
+        priority: maxP + 1,
+      });
+      poolIds.add(id);
+      added++;
+    } catch {
+      // 跳过失败候选
+    }
+  }
+  if (added > 0) {
+    pool.updatedAt = Date.now();
+    await savePool(kind, pool);
+  }
+  return added;
+}
+
+// ---------------------------------------------------------------------------
+// 刷新调度（TTL）：池为空或过期时自动重新发现（启动后台 / 用到时懒刷新 / 手动）
+// ---------------------------------------------------------------------------
+
+function isFresh(pool: EPPoolState): boolean {
+  return (
+    pool.models.length > 0 &&
+    Date.now() - pool.updatedAt < pool.config.ttlHours * 3_600_000
+  );
+}
+
+const refreshingKind = new Map<PoolKind, Promise<EPPoolState>>();
+
+async function refreshKind(kind: PoolKind): Promise<EPPoolState> {
+  const existing = refreshingKind.get(kind);
+  if (existing) return existing;
+  const task = (async () => {
+    await discoverKind({} as ExtensionContext, kind);
+    const pool = await loadPool(kind);
+    pool.updatedAt = Date.now();
+    await savePool(kind, pool);
+    return pool;
+  })();
+  refreshingKind.set(kind, task);
+  try {
+    return await task;
+  } finally {
+    refreshingKind.delete(kind);
+  }
+}
+
+async function ensureFreshPool(kind: PoolKind): Promise<EPPoolState> {
+  const pool = await loadPool(kind);
+  if (isFresh(pool)) return pool;
+  try {
+    return await refreshKind(kind);
+  } catch {
+    return pool; // 刷新失败不阻塞，用旧池
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +537,7 @@ const BUILTIN_CANDIDATES: Record<PoolKind, BuiltinCandidate[]> = {
       models: [{ id: "mimo-v2.5-asr" }],
     },
   ],
+  rerank: [],
 };
 
 /** TTS 等端点：400 时从错误信息提取支持的 voice 并重试（自动适配）。 */
@@ -517,35 +667,53 @@ async function discoverBuiltinCandidates(kind: PoolKind): Promise<number> {
 // 调用
 // ---------------------------------------------------------------------------
 
-function findModel(pool: EPPoolState, modelId?: string): EPPoolModel | undefined {
-  const online = pool.models.slice().sort((a, b) => a.priority - b.priority);
-  if (modelId) return online.find((m) => m.id.includes(modelId)) ?? online[0];
-  return online[0];
+/** 按优先级返回候选模型（数字越小越优先）。modelId 匹配项排最前，其余兜底。 */
+function candidatesOf(pool: EPPoolState, modelId?: string): EPPoolModel[] {
+  const sorted = pool.models
+    .slice()
+    .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
+  if (!modelId) return sorted;
+  const matched = sorted.filter((m) => m.id.includes(modelId));
+  return matched.length > 0
+    ? [...matched, ...sorted.filter((m) => !matched.includes(m))]
+    : sorted;
 }
 
-/** 嵌入：文本 → 向量 JSON（截断展示）。 */
+/** 嵌入：文本 → 向量 JSON（按优先级依次尝试，全失败可刷新重试）。 */
 async function embedText(ctx: ExtensionContext, text: string, signal?: AbortSignal): Promise<{ model: string; dim: number; vector: number[] }> {
-  const pool = await loadPool("embed");
-  const m = findModel(pool);
-  if (!m) throw new Error("嵌入池为空，请先运行 /embed-discover");
-  const key = resolvePoolKey(m.apiKeyRef);
-  const r = await sendEndpointRequest(m.baseUrl, key ?? "", "embed", m.id, { model: m.id, input: text }, signal ?? AbortSignal.timeout(60_000));
-  if (r.status !== 200) throw new Error(`HTTP ${r.status} ${r.text.slice(0, 150)}`);
-  const j = JSON.parse(r.text) as { data?: Array<{ embedding?: number[] }> };
-  const vec = j.data?.[0]?.embedding;
-  if (!vec) throw new Error("响应中没有 embedding");
-  return { model: m.id, dim: vec.length, vector: vec.slice(0, 8) };
+  const attempt = async (pool: EPPoolState): Promise<{ model: string; dim: number; vector: number[] }> => {
+    const errors: string[] = [];
+    for (const m of candidatesOf(pool)) {
+      try {
+        const key = resolvePoolKey(m.apiKeyRef);
+        const r = await sendEndpointRequest(m.baseUrl, key ?? "", "embed", m.id, { model: m.id, input: text }, signal ?? AbortSignal.timeout(60_000));
+        if (r.status !== 200) throw new Error(`HTTP ${r.status} ${r.text.slice(0, 150)}`);
+        const j = JSON.parse(r.text) as { data?: Array<{ embedding?: number[] }> };
+        const vec = j.data?.[0]?.embedding;
+        if (!vec) throw new Error("响应中没有 embedding");
+        return { model: m.id, dim: vec.length, vector: vec.slice(0, 8) };
+      } catch (err) {
+        errors.push(`${m.id}: ${errMsg(err)}`);
+      }
+    }
+    throw new Error(errors.length ? errors.join("；") : "嵌入池为空");
+  };
+  const pool = await ensureFreshPool("embed");
+  if (pool.models.length === 0) throw new Error("嵌入池为空，请先运行 /embed-discover");
+  try {
+    return await attempt(pool);
+  } catch (firstErr) {
+    if (!pool.config.refreshOnAllFailed) throw firstErr;
+    try {
+      return await attempt(await refreshKind("embed"));
+    } catch {
+      throw firstErr;
+    }
+  }
 }
 
-/** TTS：文本 → 音频文件路径。 */
-async function synthesizeSpeech(
-  ctx: ExtensionContext,
-  text: string,
-  signal?: AbortSignal,
-): Promise<{ path: string; model: string }> {
-  const pool = await loadPool("tts");
-  const m = findModel(pool);
-  if (!m) throw new Error("TTS 池为空，请先运行 /tts-discover");
+/** TTS 单模型调用（小米特殊格式 + 通用 /audio/speech 两路径）。 */
+async function synthesizeOnce(m: EPPoolModel, text: string, signal: AbortSignal): Promise<{ path: string; model: string }> {
   if (m.provider === "xiaomi-clean") {
     const key = getXiaomiKey();
     if (!key) throw new Error("未找到小米 API key（MIMO_API_KEY 或 auth.json xiaomi-clean）");
@@ -560,7 +728,7 @@ async function synthesizeSpeech(
         ],
         audio: { format: "wav", voice: "Chloe" },
       }),
-      signal: signal ?? AbortSignal.timeout(120_000),
+      signal,
     });
     const t = await r.text();
     if (r.status !== 200) throw new Error("HTTP " + r.status + " " + t.slice(0, 150));
@@ -576,13 +744,13 @@ async function synthesizeSpeech(
   }
   const key = resolvePoolKey(m.apiKeyRef);
   let body: Record<string, unknown> = { model: m.id, input: text, voice: "alloy", response_format: "mp3" };
-  let r = await sendEndpointRequest(m.baseUrl, key ?? "", "tts", m.id, body, signal ?? AbortSignal.timeout(120_000));
+  let r = await sendEndpointRequest(m.baseUrl, key ?? "", "tts", m.id, body, signal);
   if (r.status === 400 && r.text.includes("Supported voices")) {
     const names = r.text.match(/[a-z0-9-]+-en|[a-z0-9]+-[a-z0-9]+-en|[a-z0-9-]+/g) ?? [];
     const voice = names.find((v) => /-en$/.test(v) || v.includes("-"));
     if (voice) {
       body = { model: m.id, input: text, voice, response_format: "mp3" };
-      r = await sendEndpointRequest(m.baseUrl, key ?? "", "tts", m.id, body, signal ?? AbortSignal.timeout(120_000));
+      r = await sendEndpointRequest(m.baseUrl, key ?? "", "tts", m.id, body, signal);
     }
   }
   if (r.status !== 200 || !r.buffer || r.buffer.length === 0) {
@@ -596,15 +764,39 @@ async function synthesizeSpeech(
   return { path: file, model: m.id };
 }
 
-/** ASR：音频文件 → 文本。 */
-async function transcribeAudio(
+/** TTS：文本 → 音频文件路径（按优先级依次尝试，全失败可刷新重试）。 */
+async function synthesizeSpeech(
   ctx: ExtensionContext,
-  audioPath: string,
+  text: string,
   signal?: AbortSignal,
-): Promise<{ text: string; model: string }> {
-  const pool = await loadPool("asr");
-  const m = findModel(pool);
-  if (!m) throw new Error("ASR 池为空，请先运行 /asr-discover");
+): Promise<{ path: string; model: string }> {
+  const attempt = async (pool: EPPoolState): Promise<{ path: string; model: string }> => {
+    const errors: string[] = [];
+    for (const m of candidatesOf(pool)) {
+      try {
+        return await synthesizeOnce(m, text, signal ?? AbortSignal.timeout(120_000));
+      } catch (err) {
+        errors.push(`${m.id}: ${errMsg(err)}`);
+      }
+    }
+    throw new Error(errors.length ? errors.join("；") : "TTS 池为空");
+  };
+  const pool = await ensureFreshPool("tts");
+  if (pool.models.length === 0) throw new Error("TTS 池为空，请先运行 /tts-discover");
+  try {
+    return await attempt(pool);
+  } catch (firstErr) {
+    if (!pool.config.refreshOnAllFailed) throw firstErr;
+    try {
+      return await attempt(await refreshKind("tts"));
+    } catch {
+      throw firstErr;
+    }
+  }
+}
+
+/** ASR 单模型调用（小米特殊格式 + 通用 /audio/transcriptions 两路径）。 */
+async function transcribeOnce(m: EPPoolModel, audioPath: string, signal: AbortSignal): Promise<{ text: string; model: string }> {
   if (m.provider === "xiaomi-clean") {
     const key = getXiaomiKey();
     if (!key) throw new Error("未找到小米 API key（MIMO_API_KEY 或 auth.json xiaomi-clean）");
@@ -623,7 +815,7 @@ async function transcribeAudio(
           },
         ],
       }),
-      signal: signal ?? AbortSignal.timeout(120_000),
+      signal,
     });
     const t = await r.text();
     if (r.status !== 200) throw new Error("HTTP " + r.status + " " + t.slice(0, 150));
@@ -643,7 +835,7 @@ async function transcribeAudio(
     method: "POST",
     headers: { Authorization: `Bearer ${key ?? ""}` },
     body: fd,
-    signal: signal ?? AbortSignal.timeout(120_000),
+    signal,
   });
   const text = await res.text().catch(() => "");
   if (res.status !== 200) throw new Error(`HTTP ${res.status} ${text.slice(0, 150)}`);
@@ -651,7 +843,88 @@ async function transcribeAudio(
   return { text: j.text ?? text, model: m.id };
 }
 
+/** ASR：音频文件 → 文本（按优先级依次尝试，全失败可刷新重试）。 */
+async function transcribeAudio(
+  ctx: ExtensionContext,
+  audioPath: string,
+  signal?: AbortSignal,
+): Promise<{ text: string; model: string }> {
+  const attempt = async (pool: EPPoolState): Promise<{ text: string; model: string }> => {
+    const errors: string[] = [];
+    for (const m of candidatesOf(pool)) {
+      try {
+        return await transcribeOnce(m, audioPath, signal ?? AbortSignal.timeout(120_000));
+      } catch (err) {
+        errors.push(`${m.id}: ${errMsg(err)}`);
+      }
+    }
+    throw new Error(errors.length ? errors.join("；") : "ASR 池为空");
+  };
+  const pool = await ensureFreshPool("asr");
+  if (pool.models.length === 0) throw new Error("ASR 池为空，请先运行 /asr-discover");
+  try {
+    return await attempt(pool);
+  } catch (firstErr) {
+    if (!pool.config.refreshOnAllFailed) throw firstErr;
+    try {
+      return await attempt(await refreshKind("asr"));
+    } catch {
+      throw firstErr;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
+/** 重排：query + 文档列表 → 按相关性降序的结果（按优先级依次尝试，全失败可刷新重试）。 */
+async function rerankText(
+  ctx: ExtensionContext,
+  query: string,
+  documents: string[],
+  signal?: AbortSignal,
+): Promise<{ model: string; results: Array<{ index: number; score: number; text: string }> }> {
+  const attempt = async (pool: EPPoolState): Promise<{ model: string; results: Array<{ index: number; score: number; text: string }> }> => {
+    const errors: string[] = [];
+    for (const m of candidatesOf(pool)) {
+      try {
+        const key = resolvePoolKey(m.apiKeyRef);
+        const r = await sendEndpointRequest(
+          m.baseUrl, key ?? "", "rerank", m.id,
+          { model: m.id, query, documents },
+          signal ?? AbortSignal.timeout(60_000),
+        );
+        if (r.status !== 200) throw new Error(`HTTP ${r.status} ${r.text.slice(0, 150)}`);
+        const j = JSON.parse(r.text) as {
+          results?: Array<{ index?: number; relevance_score?: number; document?: { text?: string } }>;
+        };
+        const results = (j.results ?? [])
+          .map((x) => ({
+            index: typeof x.index === "number" ? x.index : -1,
+            score: typeof x.relevance_score === "number" ? x.relevance_score : 0,
+            text: x.document?.text ?? documents[x.index ?? -1] ?? "",
+          }))
+          .sort((a, b) => b.score - a.score);
+        if (results.length === 0) throw new Error("响应中没有重排结果");
+        return { model: m.id, results };
+      } catch (err) {
+        errors.push(`${m.id}: ${errMsg(err)}`);
+      }
+    }
+    throw new Error(errors.length ? errors.join("；") : "重排池为空");
+  };
+  const pool = await ensureFreshPool("rerank");
+  if (pool.models.length === 0) throw new Error("重排池为空，请先运行 /rerank-discover");
+  try {
+    return await attempt(pool);
+  } catch (firstErr) {
+    if (!pool.config.refreshOnAllFailed) throw firstErr;
+    try {
+      return await attempt(await refreshKind("rerank"));
+    } catch {
+      throw firstErr;
+    }
+  }
+}
+
 // 命令与工具注册
 // ---------------------------------------------------------------------------
 
@@ -703,6 +976,23 @@ function registerKindCommands(pi: ExtensionAPI, kind: PoolKind): void {
         );
       } catch (err) {
         ctx.ui.notify(`发现失败：${errMsg(err)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand(`${prefix}-refresh`, {
+    description: `强制刷新${spec.label}池（重新发现并验证模型，含 OpenRouter 免费模型）`,
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(`正在刷新${spec.label}池…`, "info");
+      try {
+        await refreshKind(kind);
+        const pool = await loadPool(kind);
+        ctx.ui.notify(
+          `${spec.label}池已刷新：在线 ${pool.models.length} 个模型`,
+          "info",
+        );
+      } catch (err) {
+        ctx.ui.notify(`刷新失败：${errMsg(err)}`, "error");
       }
     },
   });
@@ -764,28 +1054,29 @@ function registerKindCommands(pi: ExtensionAPI, kind: PoolKind): void {
 }
 
 export function initEndpointPools(pi: ExtensionAPI): void {
-  for (const kind of ["embed", "tts", "asr"] as PoolKind[]) {
+  for (const kind of ["embed", "tts", "asr", "rerank"] as PoolKind[]) {
     registerKindCommands(pi, kind);
   }
 
-  // ---- 首次运行自动发现：池为空且已配置对应 key 时，后台自动发现（新用户开箱即用） ----
+  // ---- 自动发现调度：池为空或过期（TTL）且已配置对应 key 时，后台自动刷新 ----
   pi.on("session_start", (_event, ctx) => {
     if (ctx.mode === "print") return;
     void (async () => {
-      for (const kind of ["embed", "tts", "asr"] as PoolKind[]) {
+      for (const kind of ["embed", "tts", "asr", "rerank"] as PoolKind[]) {
         try {
           const pool = await loadPool(kind);
-          if (pool.models.length > 0) continue;
+          if (pool.models.length > 0 && isFresh(pool)) continue;
+          if (pool.models.length > 0 && !pool.config.refreshOnStartup) continue;
           const hasKey =
             kind === "embed"
               ? !!(getEnvValue("OPENROUTER_API_KEY") ||
                   getEnvValue("CLOUDFLARE_API_KEY") ||
                   getEnvValue("NVIDIA_API_KEY"))
-              : kind === "tts"
-                ? !!(getEnvValue("OPENROUTER_API_KEY") || getXiaomiKey())
-                : !!getXiaomiKey();
+              : kind === "tts" || kind === "asr"
+                ? !!(getXiaomiKey() || getEnvValue("OPENROUTER_API_KEY"))
+                : !!getEnvValue("OPENROUTER_API_KEY"); // rerank
           if (!hasKey) continue;
-          await discoverKind(ctx, kind);
+          await refreshKind(kind);
         } catch {
           // 静默：发现失败不影响启动
         }
@@ -901,6 +1192,32 @@ export function initEndpointPools(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerTool({
+    name: "rerank_text",
+    label: "Rerank Text",
+    description: "通过重排池把文档列表按与查询的相关性排序（返回索引/分数/文本）。重排池需先 /rerank-discover。",
+    promptSnippet: "文档重排（相关性排序）",
+    promptGuidelines: ["当用户要求对搜索候选、检索结果、文档片段按与查询的相关性排序时，使用 rerank_text 工具。"],
+    parameters: Type.Object({
+      query: Type.String({ description: "查询文本" }),
+      documents: Type.Array(Type.String(), { description: "待排序的文档/文本列表" }),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const r = await rerankText(ctx, params.query, params.documents, signal);
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `模型：${r.model}\n按相关性排序（${r.results.length} 条）：\n` +
+              r.results.map((x, i) => `${i + 1}. [${x.score.toFixed(4)}] ${x.text}`).join("\n"),
+          },
+        ],
+        details: { model: r.model, results: r.results },
+      };
+    },
+  });
+
   // ---- 便捷命令 ----
   pi.registerCommand("embed", {
     description: "文本 → 向量（嵌入池）。用法：/embed <文本>",
@@ -949,6 +1266,33 @@ export function initEndpointPools(pi: ExtensionAPI): void {
         ctx.ui.notify(`转录结果（${r.model}）：${r.text.slice(0, 200)}`, "info");
       } catch (err) {
         ctx.ui.notify(`转录失败：${errMsg(err)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("rerank", {
+    description: "文档重排（重排池）。用法：/rerank <查询> | <文档1> | <文档2> …",
+    handler: async (args, ctx) => {
+      const parts = args
+        .split("|")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (parts.length < 2) {
+        ctx.ui.notify("用法：/rerank <查询> | <文档1> | <文档2> …", "warning");
+        return;
+      }
+      const query = parts[0];
+      const documents = parts.slice(1);
+      ctx.ui.notify("正在重排…", "info");
+      try {
+        const r = await rerankText(ctx, query, documents);
+        const top = r.results
+          .slice(0, 5)
+          .map((x, i) => `${i + 1}.${x.text.slice(0, 24)}(${x.score.toFixed(3)})`)
+          .join("  ");
+        ctx.ui.notify(`重排结果（${r.model}）：${top}`, "info");
+      } catch (err) {
+        ctx.ui.notify(`重排失败：${errMsg(err)}`, "error");
       }
     },
   });

@@ -4,7 +4,7 @@
 
 **万池归于此 · 百川东到海** — 免费优先的 pi 模型池扩展
 
-`/model` 只显示免费模型 · 纯文本模型自动看图 · 图像生成/嵌入/TTS/ASR 池
+`/model` 只显示免费模型 · 纯文本模型自动看图 · 图像生成/嵌入/TTS/ASR/重排 池
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![pi extension](https://img.shields.io/badge/pi-extension-4B32C3)](https://github.com/earendil-works/pi)
@@ -21,9 +21,9 @@
 
 1. **免费 Provider 注册**：`/model` 选择器中 openrouter 提供商**只显示免费模型**——不再被几百个付费模型淹没
 2. **视觉模型池**：纯文本模型也能"看"图片——上传图片时自动交给视觉池中优先级最高的多模态模型识别，识别结果以文字注入对话
-3. **六池全自动化**：视觉 / 图像生成 / 嵌入 / TTS / ASR 全部支持自然语言触发，无需用户记命令
+3. **六池全自动化**：视觉 / 图像生成 / 嵌入 / TTS / ASR / 重排 全部支持自然语言触发，无需用户记命令
 
-> 所有池共享同一份模型数据与缓存，启动只需一次网络请求；所有文件路径参数均支持绝对路径与相对路径。
+> 视觉/图像/免费 provider 共享同一份 OpenRouter 目录缓存；端点池到期时按 `output_modalities` 精确拉取。所有文件路径参数均支持绝对路径与相对路径。
 
 ---
 
@@ -32,14 +32,15 @@
 | 功能 | 说明 |
 |------|------|
 | 🆓 **免费 Provider** | openrouter 提供商只保留免费模型（定价 0/0），`/model` 干净清爽 |
-| 🔄 **自动刷新** | 免费列表变化频繁（每周甚至更勤），缓存 6h 自动重拉；失败自动回退缓存 |
+| 🔄 **全池自动刷新** | 各池过期（默认 24h）自动重拉新模型：视觉/图像池从 OpenRouter 目录，嵌入/TTS/ASR/重排端点池按 `output_modalities` 精确拉取并端点验证；免费 provider 缓存 6h 自动重拉；失败自动回退旧池/缓存 |
 | 📷 **自动看图** | 文本模型收到图片时，自动调用视觉池最高优先级的多模态模型描述 |
 | 🚫 **伪多模态屏蔽** | 自动检测声明支持图片但实际无法处理图片的模型（如 sensenova），跳过并回退下一个候选 |
-| 🗣️ **自然语言触发** | 发音频自动转写、说"读出来"自动合成语音、问相似度自动嵌入、说"画图"自动生图——五池全部自动 |
+| 🗣️ **自然语言触发** | 发音频自动转写、说"读出来"自动合成语音、问相似度自动嵌入、说"画图"自动生图、问"哪个最相关"自动重排——六池全部自动 |
 | 🖼️ **图像生成池** | `/img-generate <提示词>` 或 `generate_image` 工具：按优先级生成图片；支持 `outputPath` 指定任意保存路径 |
 | 🔢 **嵌入池** | `/embed <文本>` 或 `embed_text` 工具：文本 → 向量（相似度/检索） |
 | 🎙️ **TTS 池** | `/tts <文本>` 或 `text_to_speech` 工具：文本 → 语音文件；支持 `outputPath` 指定保存路径 |
 | 🗣️ **ASR 池** | `/asr <音频>` 或 `transcribe_audio` 工具：音频 → 文本；绝对/相对路径自动处理 |
+| 📊 **重排池** | `/rerank <查询> \| <文档…>` 或 `rerank_text` 工具：文档按相关性排序（检索/搜索排序） |
 | 🎯 **优先级管理** | 免费优先、性能其次；手动优先级刷新后永久保留 |
 | 🤖 **AI 自动发现** | 读取你配置的模型服务商，用你的模型分析多模态模型并实测验证后入池 |
 | 🛡️ **容错设计** | 下架感知、失败自动刷新重试、伪多模态自动回退、网络失败回退缓存 |
@@ -83,6 +84,7 @@ setx OPENROUTER_API_KEY "sk-or-..."
 发音频文件路径        → 自动转写并注入文本（ASR 池）
 "把这段话读出来"      → 自动合成语音（TTS 池）
 "这两个文本相似吗"    → 自动计算向量（嵌入池）
+"哪个结果最相关"     → 自动重排（重排池）
 "画一只太空猫"       → 自动生成图片（图像生成池，付费）
 ```
 
@@ -163,6 +165,52 @@ OpenRouter 路径不受影响（HTTP 状态码已有兜底），仅对 `registry
 
 ---
 
+## 🧩 嵌入 / TTS / ASR / 重排 端点池
+
+四个专用端点池（`/embed`、`/tts`、`/asr`、`/rerank`）与视觉池一样**全自动维护**——OpenRouter 上新的免费 embeddings / TTS / transcription / rerank 模型会自动被发现并加入。
+
+**关键点**：OpenRouter 的 `/models` 接口**默认只返回 chat 模型**，embeddings / 语音 / 重排等专用端点模型必须用 `output_modalities` 过滤参数才能列出。万川据此精确拉取：
+
+| 池 | OpenRouter 目录过滤参数 | 目录中的 free 示例 |
+|----|------------------------|-------------------|
+| 嵌入 | `output_modalities=embeddings` | `liquid/lfm-2.5-embedding-350m:free`、`nvidia/nemotron-3-embed-1b:free`、`nvidia/llama-nemotron-embed-vl-1b-v2:free` |
+| TTS | `output_modalities=speech` | `deepgram/flux-tts:free`、`fish-audio/s2.1-pro-free:free` |
+| ASR | `output_modalities=transcription` | 暂无 free（有 `qwen/qwen3-asr-*`、`mistralai/voxtral-*-stt` 等付费） |
+| 重排 | `output_modalities=rerank` | `nvidia/llama-nemotron-rerank-vl-1b-v2:free`（其余目录标注 free 的 rerank 模型端点验证返回 402，被自动剔除） |
+
+**发现与入池流程**：
+
+```
+池过期（默认 24h）或首次启动 ──► 拉 OpenRouter 目录（按 output_modalities 过滤）
+                                      │
+                                      ├─ 筛选 free（prompt/completion 均定价 0）
+                                      ├─ 逐候选【端点实测验证】（发最小请求，200 才入池）
+                                      └─ 合并用户 models.json 服务商关键词候选 + 内置免费候选
+```
+
+**刷新策略（与视觉池同款）**：
+
+| 策略 | 说明 |
+|------|------|
+| 懒刷新 + TTL | 池过期（默认 24h）后，第一次使用时先刷新再用 |
+| 启动后台刷新 | 启动时池为空或过期，后台异步刷新 |
+| 手动刷新 | `/embed-refresh` / `/tts-refresh` / `/asr-refresh` / `/rerank-refresh` 随时强制 |
+| 失败触发 | 调用时全部候选失败（免费模型被下架）自动强制刷新一次并重试 |
+| 端点验真 | 目录标注只作候选；`/embeddings`、`/audio/speech`、`/audio/transcriptions`、`/rerank` 请求 200 才入池（目录里标 free 但端点返回 402 的假免费模型自动剔除），LLM 不参与、零幻觉 |
+
+**兜底来源**：OpenRouter 目录拉取失败、或目录外的隐藏模型（如 `nvidia/nv-embed-v1`、Cloudflare `bge`、小米 `mimo-v2.5-tts/asr`），由内置候选清单与用户服务商 `/models` 关键词发现补齐。
+
+**配置**：每个池的 `~/.pi/agent/<embed|tts|asr|rerank>-pool.json` 支持 `config` 字段（旧文件无 config 自动用默认值）：
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `ttlHours` | `24` | 池过期时间（小时） |
+| `refreshOnStartup` | `true` | 启动时池为空/过期则后台刷新 |
+| `refreshOnAllFailed` | `true` | 全部候选失败时强制刷新重试 |
+| `maxModels` | `100` | 池容量上限 |
+
+---
+
 ## 🤖 AI 自动发现（autoDiscover）
 
 > 适配冷门模型服务商的正解：不为每家写适配器，让 LLM 自适应。
@@ -222,9 +270,10 @@ OpenRouter 路径不受影响（HTTP 状态码已有兜底），仅对 `registry
 | `/img-add [provider] [modelId]` | 把用户服务商的图像生成模型（如 agnes-image-2.1-flash）加入池，端点验证后入池 |
 | `/img-remove [关键字]` | 从图像池移除模型 |
 | `/img-generate <提示词>` | 生成图片并保存（默认 Downloads 目录）；尺寸不被支持时自动回退 |
-| `/embed-pool` · `/embed-discover` · `/embed <文本>` | 嵌入池：查看 / 发现 / 文本转向量 |
-| `/tts-pool` · `/tts-discover` · `/tts <文本>` | TTS 池：查看 / 发现 / 文本转语音 |
-| `/asr-pool` · `/asr-discover` · `/asr <音频>` | ASR 池：查看 / 发现 / 音频转文本 |
+| `/embed-pool` · `/embed-refresh` · `/embed-discover` · `/embed <文本>` | 嵌入池：查看 / 强制刷新 / 发现 / 文本转向量 |
+| `/tts-pool` · `/tts-refresh` · `/tts-discover` · `/tts <文本>` | TTS 池：查看 / 强制刷新 / 发现 / 文本转语音 |
+| `/asr-pool` · `/asr-refresh` · `/asr-discover` · `/asr <音频>` | ASR 池：查看 / 强制刷新 / 发现 / 音频转文本 |
+| `/rerank-pool` · `/rerank-refresh` · `/rerank-discover` · `/rerank <查询> \| <文档…>` | 重排池：查看 / 强制刷新 / 发现 / 文档重排 |
 | `/mm-status` | 当前模型、视觉池、API key、自动发现状态 |
 | `/mm-config` | 查看视觉池配置 |
 
@@ -237,6 +286,7 @@ OpenRouter 路径不受影响（HTTP 状态码已有兜底），仅对 `registry
 | `embed_text` | `text` | 文本 → 向量（走嵌入池） |
 | `text_to_speech` | `text` / `outputPath` | 文本 → 语音文件（支持指定保存路径） |
 | `transcribe_audio` | `audioPath` | 音频 → 文本（绝对/相对路径自动处理） |
+| `rerank_text` | `query` / `documents` | 文档列表按与查询的相关性排序（走重排池） |
 | `mm_pool_info` | `limit` | 查询视觉池信息（数量、优先级、免费/付费等） |
 
 > 所有文件路径参数均自动区分绝对路径与相对路径：传入 `D:\xxx\file.ext` 等绝对路径直接使用，传入相对路径时以当前工作目录为基准拼接。
@@ -329,7 +379,7 @@ pi-wanchuan/              # 复制整个目录到 ~/.pi/agent/extensions/
 ├── or-free.ts               # 共享数据层（拉取/缓存/防并发）+ 免费 provider 注册
 ├── vision-pool.ts           # 视觉模型池（自动看图 + AI 自动发现 + 伪多模态检测）
 ├── image-gen.ts             # 图像生成池
-├── endpoint-pool.ts         # 嵌入/TTS/ASR 端点池（服务商发现 + 实测验证）
+├── endpoint-pool.ts         # 嵌入/TTS/ASR/重排 端点池（OpenRouter 目录自动发现 + 服务商发现 + 端点实测验证 + TTL 自动刷新）
 └── filter-providers.ts      # 内置 provider 模型筛选（nvidia/cloudflare/zai 只留旗舰）
 ```
 
@@ -347,6 +397,8 @@ pi-wanchuan/              # 复制整个目录到 ~/.pi/agent/extensions/
 | 2026-08 | 路径处理修复：`generate_image` 的 `outputPath` 与 `transcribe_audio` 的 `audioPath` 增加 `isAbsolute` 判断，绝对路径不再被拼接到 cwd 后 |
 | 2026-08 | `text_to_speech` 工具新增 `outputPath` 参数，支持指定任意保存路径 |
 | 2026-08 | 伪多模态检测：自动识别声明支持图片但实际无法处理图片的模型（如 sensenova），跳过并回退下一个候选，提升视觉池鲁棒性 |
+| 2026-08 | 端点池全自动刷新：嵌入/TTS/ASR 池改为 TTL（默认 24h）自动刷新 + 启动后台刷新 + 懒刷新 + 全失败重试；新增 `/embed-refresh` `/tts-refresh` `/asr-refresh`；修复 OpenRouter 目录发现（`/models` 默认只返回 chat 模型，改用 `output_modalities=embeddings/speech/transcription` 精确拉取），未来 OpenRouter 新上免费 embeddings/TTS/transcription 模型时自动入池 |
+| 2026-08 | 新增重排池（rerank）：`/rerank`、`/rerank-pool`、`/rerank-discover`、`/rerank-refresh`、`/rerank-priority` 命令 + `rerank_text` 工具；按 `output_modalities=rerank` 自动发现，端点验证剔除 402 假免费模型，当前可用免费模型为 `nvidia/llama-nemotron-rerank-vl-1b-v2:free` |
 
 ---
 
