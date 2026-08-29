@@ -18,6 +18,7 @@ import { initVisionPool } from "./vision-pool.ts";
 import { initProviderFilter } from "./filter-providers.ts";
 import { initImageGen } from "./image-gen.ts";
 import { initEndpointPools } from "./endpoint-pool.ts";
+import { initScnetSchedule } from "./scnet-schedule.ts";
 
 export default async function (pi: ExtensionAPI) {
   // 先等待 provider 注册（启动时拉取/缓存一次），再初始化各池
@@ -27,4 +28,5 @@ export default async function (pi: ExtensionAPI) {
   initVisionPool(pi);
   initImageGen(pi);
   initEndpointPools(pi);
+  initScnetSchedule(pi);
 }

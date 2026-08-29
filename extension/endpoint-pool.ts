@@ -1038,9 +1038,17 @@ export function initEndpointPools(pi: ExtensionAPI): void {
                 ? !!(getXiaomiKey() || getEnvValue("OPENROUTER_API_KEY"))
                 : !!getEnvValue("OPENROUTER_API_KEY"); // rerank
           if (!hasKey) continue;
-          await refreshKind(kind, ctx);
-        } catch {
-          // 静默：发现失败不影响启动
+          const fresh = await refreshKind(kind, ctx);
+          ctx.ui.notify(
+            `[${kind}-pool] ${KIND_SPECS[kind].label}池已更新：${fresh.models.length} 个模型`,
+            "info",
+          );
+        } catch (err) {
+          // 与 vision-pool 一致：后台刷新失败提示用到时会按需重试
+          ctx.ui.notify(
+            `[${kind}-pool] ${KIND_SPECS[kind].label}池后台刷新失败（用到时重试）：${errMsg(err)}`,
+            "warning",
+          );
         }
       }
     })();

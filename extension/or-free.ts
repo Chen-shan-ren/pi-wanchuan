@@ -85,6 +85,8 @@ function toPiModel(model: RawORModel): PiModelConfig {
 
 let memoryCatalog: RawORModel[] | undefined;
 let memoryFetchedAt = 0;
+/** 最后一次真正联网成功拉取目录的时间（用于判断启动时是否发生了网络刷新） */
+let lastNetworkFetchAt = 0;
 let refreshing: Promise<RawORModel[]> | undefined;
 
 async function fetchCatalog(): Promise<RawORModel[]> {
@@ -146,6 +148,7 @@ export async function getOpenRouterCatalog(force = false): Promise<RawORModel[]>
       const fresh = await fetchCatalog();
       memoryCatalog = fresh;
       memoryFetchedAt = Date.now();
+      lastNetworkFetchAt = Date.now();
       writeCacheFile(fresh);
       return fresh;
     } catch {
@@ -200,14 +203,32 @@ function providerConfig(models: PiModelConfig[]) {
 export async function initFreeProvider(pi: ExtensionAPI): Promise<void> {
   // ---- 启动：等待目录就绪（缓存命中时无网络）并注册免费 provider ----
   // 注意：TUI 模式下 console.* 会污染终端屏幕（扩展重载时重新打印），一律静默。
+  let startupFetchedNetwork = false;
+  let startupFreeCount = 0;
   try {
+    const prevFetch = lastNetworkFetchAt;
     const catalog = await getOpenRouterCatalog();
+    startupFetchedNetwork = lastNetworkFetchAt > prevFetch; // 本次启动真正联网拉取
     const free = catalog.filter(isFreeModel).map(toPiModel);
     if (free.length > 0) {
       pi.registerProvider("openrouter", providerConfig(mergeModels(free, readCustomOpenRouterModels())));
+      startupFreeCount = free.length;
     }
   } catch {
     // 失败：保留 pi 内置的 openrouter 目录
+  }
+
+  // ---- 启动提示：目录真正联网刷新后，会话开始时补一条通知（与 vision-pool 一致） ----
+  if (startupFetchedNetwork && startupFreeCount > 0) {
+    let notified = false;
+    pi.on("session_start", (_event, ctx) => {
+      if (notified || ctx.mode === "print") return;
+      notified = true;
+      ctx.ui.notify(
+        `[openrouter-free] 免费模型目录已更新：${startupFreeCount} 个免费模型`,
+        "info",
+      );
+    });
   }
 
   // ---- 手动刷新命令 ----
