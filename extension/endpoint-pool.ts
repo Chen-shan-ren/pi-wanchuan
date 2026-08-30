@@ -30,7 +30,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isFreeModel, type RawORModel } from "./or-free.ts";
-import { getEnvValue, resolveApiKey, readUserProviders, type UserProvider } from "./shared.ts";
+import { getEnvValue, resolveApiKey, readUserProviders, safeNotify, type UserProvider } from "./shared.ts";
 
 // ---------------------------------------------------------------------------
 // 池种类定义
@@ -1039,16 +1039,13 @@ export function initEndpointPools(pi: ExtensionAPI): void {
                 : !!getEnvValue("OPENROUTER_API_KEY"); // rerank
           if (!hasKey) continue;
           const fresh = await refreshKind(kind, ctx);
-          ctx.ui.notify(
-            `[${kind}-pool] ${KIND_SPECS[kind].label}池已更新：${fresh.models.length} 个模型`,
-            "info",
-          );
+          // 后台刷新：ctx 可能在 await 期间因 session 替换/reload 失效（0.84.4 起访问
+          // 失效 ctx 的 ui getter 直接抛错，未捕获会以 uncaughtException 带崩进程），
+          // 延迟通知一律走 safeNotify
+          safeNotify(ctx, `[${kind}-pool] ${KIND_SPECS[kind].label}池已更新：${fresh.models.length} 个模型`, "info");
         } catch (err) {
           // 与 vision-pool 一致：后台刷新失败提示用到时会按需重试
-          ctx.ui.notify(
-            `[${kind}-pool] ${KIND_SPECS[kind].label}池后台刷新失败（用到时重试）：${errMsg(err)}`,
-            "warning",
-          );
+          safeNotify(ctx, `[${kind}-pool] ${KIND_SPECS[kind].label}池后台刷新失败（用到时重试）：${errMsg(err)}`, "warning");
         }
       }
     })();

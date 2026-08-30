@@ -85,3 +85,20 @@ export function readUserProviders(): UserProvider[] {
   }
   return out;
 }
+/**
+ * 后台/延迟回调里的安全通知：session 替换（newSession/fork/switchSession）或 reload 之后，
+ * 之前捕获的 ctx 已失效——pi 0.84.4 起访问失效 ctx 的 `ui` getter 会直接抛错，
+ * 在未被 try/catch 的异步回调里抛错会以 uncaughtException 带崩整个进程。
+ * 通知属于尽力而为，失败静默放弃。
+ */
+export function safeNotify(
+  ctx: unknown,
+  message: string,
+  level: "info" | "warning" | "error" = "info",
+): void {
+  try {
+    (ctx as { ui?: { notify?: (m: string, l?: string) => void } }).ui?.notify?.(message, level);
+  } catch {
+    // ctx 已失效（session 替换/reload）：放弃本条通知
+  }
+}

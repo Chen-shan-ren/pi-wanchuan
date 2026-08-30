@@ -70,7 +70,7 @@ import { Type } from "typebox";
 import { join, isAbsolute } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { getOpenRouterCatalog, isFreeModel, type RawORModel } from "./or-free.ts";
-import { getEnvValue, resolveApiKey } from "./shared.ts";
+import { getEnvValue, resolveApiKey, safeNotify } from "./shared.ts";
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -1073,14 +1073,12 @@ export function initVisionPool(pi: ExtensionAPI) {
       .then((fresh) => {
         const online = fresh.models.filter((m) => !m.offline);
         const offline = fresh.models.length - online.length;
-        ctx.ui.notify(
-          `[vision-pool] 模型池已更新：${online.length} 个多模态模型` +
-            (offline > 0 ? `（${offline} 个已下架）` : ""),
-          "info",
-        );
+        // 后台刷新：ctx 可能在 await 期间因 session 替换/reload 失效，延迟通知走 safeNotify
+        safeNotify(ctx, `[vision-pool] 模型池已更新：${online.length} 个多模态模型` +
+          (offline > 0 ? `（${offline} 个已下架）` : ""), "info");
       })
       .catch((err) =>
-        ctx.ui.notify(`[vision-pool] 后台刷新失败（用到时会按需重试）：${errMsg(err)}`, "warning"),
+        safeNotify(ctx, `[vision-pool] 后台刷新失败（用到时会按需重试）：${errMsg(err)}`, "warning"),
       );
   });
 
