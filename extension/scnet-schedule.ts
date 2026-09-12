@@ -18,14 +18,14 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // 高峰时段：本地小时在 [PEAK_START, PEAK_END) 内视为高峰（含起始、不含结束）
 const PEAK_START = 9;    // 09:00 起为高峰（白天）
 const PEAK_END = 19;     // 19:00 起为低峰（晚上 7 点高峰结束）
-const PEAK_CONTEXT_WINDOW = 240000;    // 高峰（白天）：当前实测白天 240K 偶发 500，若遇到可降到 200000
-const OFFPEAK_CONTEXT_WINDOW = 360000; // 低峰（夜晚）：用户指定值，夜间负载低可能可用，需实际验证
+const PEAK_CONTEXT_WINDOW = 1048576;    // 高峰（白天）：应需求设为 1M（原 240K 是为规避高峰 500 的保守值）
+const OFFPEAK_CONTEXT_WINDOW = 1048576; // 低峰（夜晚）：1024K 上下文，夜间负载低可用，需实际验证
 
 // 是否同时应用到 scnet（国超算1）。默认 false：只影响 scnet2
 const ALSO_APPLY_TO_SCNET = false;
 
 // scnet2 / scnet 在 models.json 里的模型 id 列表
-const SCNET_MODEL_IDS = ["DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813"];
+const SCNET_MODEL_IDS = ["DeepSeek-V4-Flash-0731", "DeepSeek-V4-Pro-0813", "Kimi-K3", "Qwen3.8-Max", "GLM-5.3"];
 
 // 定时检查间隔（毫秒）
 const CHECK_INTERVAL_MS = 60_000;
@@ -46,7 +46,7 @@ function buildScnetModels(windowSize: number) {
     id,
     name: id,
     reasoning: true,
-    input: ["text", "image"],
+    input: ["text"],
     // 动态 registerProvider 会替换模型对象；必须保留完整 cost 结构，
     // 否则 pi 的费用计算读取 cost.tiers 时会触发 undefined.tiers。
     cost: {
@@ -58,6 +58,14 @@ function buildScnetModels(windowSize: number) {
     },
     contextWindow: windowSize,
     maxTokens: 65536,
+    thinkingLevelMap: {
+      minimal: null,
+      low: null,
+      medium: null,
+      high: "high",
+      xhigh: null,
+      max: "max",
+    },
   }));
 }
 
